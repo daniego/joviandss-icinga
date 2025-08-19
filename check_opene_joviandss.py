@@ -37,6 +37,36 @@ def _sanitize_label(s: str) -> str:
     # For perfdata labels: replace non-alnum/underscore with underscore
     return re.sub(r'[^A-Za-z0-9_]+', '_', s)
 
+# Threshold evaluator: handles higher-is-bad (default) and a few lower-is-bad metrics
+def _eval_thresh(metric_name: str, value: float, warn: float, crit: float) -> int:
+    """
+    Return Nagios state code 0/1/2 for OK/WARNING/CRITICAL based on thresholds.
+    By default, higher values are worse (>= crit => CRITICAL, >= warn => WARNING).
+    For metrics where lower is worse (e.g., cache hit ratios), invert the logic.
+    Also treat warn==0 specially so that value==0 stays OK.
+    """
+    if value is None:
+        return 3
+
+    LOWER_IS_BAD = {"arc_hit_ratio", "l2_hit_ratio"}
+
+    if metric_name in LOWER_IS_BAD:
+        if crit is not None and value <= crit:
+            return 2
+        if warn is not None and value <= warn:
+            return 1
+        return 0
+
+    # Default: higher is bad
+    if crit is not None and value >= crit:
+        return 2
+    if warn is not None:
+        if warn == 0 and value == 0:
+            return 0
+        if value >= warn:
+            return 1
+    return 0
+
 
 SIZE_RE = re.compile(r"^\s*([0-9]*\.?[0-9]+)\s*([KMGTPE]?)(B)?\s*$", re.IGNORECASE)
 
@@ -235,42 +265,143 @@ def parse_zfs_arc_cache(block: List[str]) -> Dict[str, Any]:
 
 def parse_zpool_summary(block: List[str]) -> Dict[str, Dict[str, Any]]:
     """
-    Parse the compact zpool summary table (with headers like: name size alloc free ckCap frag cap dedup health altroot)
-    Returns mapping: {pool_name: {"cap_pct": float, "health": str, "size": str, "alloc": str, ...}}
+    Parse the compact zpool summary table (with headers like:
+    name size alloc free frag cap dedup health altroot)
+    Returns mapping: {pool_name: {"cap_pct": float, "health": str, "size": str, ...}}
     Numeric percentages are returned without the '%' sign as floats.
+
+    This version is resilient to header variations such as 'cap', 'cap%',
+    'capacity', or vendor-specific labels, and will also fall back to:
+      1) locating the column whose header contains 'cap'
+      2) selecting the last percentage-looking token in the row
+      3) accepting numbers without a trailing '%'
+      4) computing cap_pct from alloc/size when possible
+    It also tolerates comma decimal separators (e.g. '12,3%').
     """
     pools: Dict[str, Dict[str, Any]] = {}
     header = None
+    header_lower = None
+
+    def _norm_num_token(tok: str) -> str:
+        """Normalize localized numeric tokens (convert commas to dots, strip %)."""
+        if not isinstance(tok, str):
+            return None
+        s = tok.strip()
+        # strip trailing percent and spaces
+        if s.endswith("%"):
+            s = s[:-1].strip()
+        # replace comma decimal with dot
+        s = s.replace(",", ".")
+        return s
+
+    def _tok_to_pct_loose(tok: str):
+        """Accept tokens like '12%', '12.3%', '12,3%', or just '12'/'12.3'."""
+        if not isinstance(tok, str):
+            return None
+        s = _norm_num_token(tok)
+        if s is None:
+            return None
+        try:
+            # Some pools may print '-' or 'na'
+            if s in ("-", "na", "n/a", "NA", "N/A", ""):  # ignore
+                return None
+            val = float(s)
+            # Cap percentages should be 0..100, tolerate a tiny bit over
+            if 0.0 <= val <= 101.0:
+                return round(val, 2)
+        except Exception:
+            pass
+        return None
+
     for line in block:
         if not line.strip():
             continue
         parts = line.split()
         if not parts:
             continue
-        # detect header row (contains 'name' and 'health')
-        if ("name" in parts) and ("health" in parts):
+
+        lparts = [p.lower() for p in parts]
+        # detect header row (case-insensitive). Accept 'name' or 'pool' and require 'health'.
+        if (("name" in lparts) or ("pool" in lparts)) and ("health" in lparts):
             header = parts
+            header_lower = lparts
             continue
         if header is None:
             # skip until header found
             continue
-        # align to header length; some fields like 'altroot' may be missing
+
         row = parts
         name = row[0]
-        # Build a dict aligning by index when header is known
+
+        # Build a dict aligning by index when header is known, using lowercase keys
         data: Dict[str, Any] = {}
         for i, h in enumerate(header[1:], start=1):
             if i < len(row):
-                data[h] = row[i]
-        # Normalize cap -> cap_pct
-        cap_raw = data.get("cap") or data.get("ckCap") or data.get("capacity")
+                data[h.lower()] = row[i]
+
+        # Try to find the capacity (%) column robustly
         cap_pct = None
-        if isinstance(cap_raw, str):
-            m = re.match(r"(\d+(?:\.\d+)?)%", cap_raw)
-            if m:
-                cap_pct = float(m.group(1))
+
+        # 1) Prefer header that contains 'cap'
+        cap_idx = None
+        for i, h in enumerate(header):
+            if "cap" in h.lower():
+                cap_idx = i
+                break
+        if cap_idx is not None and cap_idx < len(row):
+            # first try the token at cap_idx
+            cap_pct = _tok_to_pct_loose(row[cap_idx])
+            # if it's like '-' try adjacent token(s) (some vendors split it oddly)
+            if cap_pct is None:
+                if cap_idx + 1 < len(row):
+                    cap_pct = _tok_to_pct_loose(row[cap_idx + 1])
+                if cap_pct is None and cap_idx > 0:
+                    cap_pct = _tok_to_pct_loose(row[cap_idx - 1])
+
+        # 2) Fallback to common header names placed in the dict
+        if cap_pct is None:
+            for key in list(data.keys()):
+                lk = key.lower()
+                if lk in ("cap", "cap%", "capacity", "ckcap", "ckcap%"):
+                    cap_pct = _tok_to_pct_loose(data[key])
+                    if cap_pct is not None:
+                        break
+
+        # 3) Final fallback: pick the last token in the row that looks like a percentage/number
+        if cap_pct is None:
+            for tok in reversed(row):
+                pct = _tok_to_pct_loose(tok)
+                if pct is not None:
+                    cap_pct = pct
+                    break
+
+        # 4) Compute from alloc/size if still None and both columns exist
+        if cap_pct is None:
+            # find the column indexes for size and alloc if present
+            size_idx = None
+            alloc_idx = None
+            for i, h in enumerate(header):
+                hl = h.lower()
+                if size_idx is None and "size" in hl:
+                    size_idx = i
+                if alloc_idx is None and ("alloc" in hl or "allocated" in hl):
+                    alloc_idx = i
+            try:
+                if size_idx is not None and alloc_idx is not None and size_idx < len(row) and alloc_idx < len(row):
+                    size_b = parse_size_to_bytes(row[size_idx])
+                    alloc_b = parse_size_to_bytes(row[alloc_idx])
+                    if size_b and alloc_b is not None and size_b > 0:
+                        cap_pct = round(100.0 * float(alloc_b) / float(size_b), 2)
+            except Exception:
+                pass
+
+        # Normalize health for downstream logic
+        if "health" in data:
+            data["health"] = str(data["health"]).upper()
+
         data["cap_pct"] = cap_pct
         pools[name] = data
+
     return pools
 
 
@@ -581,13 +712,13 @@ METRIC_HELP_TEXT = (
     "  Memory: mem_used_pct (unit: %) | mem_used_bytes (unit: B) | mem_total_bytes (unit: B)\n"
     "  Processes: process_count (unit: count)\n"
     "  TCP connections: tcp_established | tcp_syn_sent | tcp_syn_recv | tcp_fin_wait1 | tcp_fin_wait2 | tcp_time_wait | tcp_close | tcp_close_wait | tcp_last_ack | tcp_listen | tcp_closing (unit: sockets)\n"
-    "  Filesystem-by-mount or fs name (require --mount or --fs):\n"
+    "  Filesystem-by-mount or fs name (require --mount or --fs). If omitted, fs_used_pct defaults to the worst-used filesystem:\n"
     "    fs_used_pct (unit: %) | fs_used_bytes (unit: B) | fs_total_bytes (unit: B) | fs_avail_bytes (unit: B)\n"
     "  Filesystem summary (across all filesystems):\n"
     "    df_used_pct (unit: %) | df_used_bytes (unit: B) | df_total_bytes (unit: B) | filesystem_count (unit: count)\n"
-    "  ZFS ARC cache: arc_size_bytes | arc_compressed_size_bytes | arc_uncompressed_size_bytes | l2_size_bytes | l2_asize_bytes | arc_hit_ratio (unit: %) | l2_hit_ratio (unit: %)\n"
+    "  ZFS ARC cache: arc_size_bytes | arc_compressed_size_bytes | arc_uncompressed_size_bytes | l2_size_bytes | l2_asize_bytes | arc_hit_ratio (unit: %, warn/crit are minimums) | l2_hit_ratio (unit: %, warn/crit are minimums)\n"
     "  ZFS pools: zpool_worst_cap_pct (unit: %) | zpool_unhealthy_count (unit: pools) | zpool_pool_cap_pct (requires --pool, unit: %)\n"
-    "  ZFS datasets (require --dataset for single dataset):\n"
+    "  ZFS datasets (require --dataset for a specific dataset). If omitted, dataset_* defaults to the worst-used dataset:\n"
     "    dataset_used_pct (unit: %) | dataset_used_bytes (unit: B) | dataset_quota_bytes (unit: B) | all_datasets\n"
     "  Plugins/inventory: plugins_count (unit: count)\n"
     "  Mail: postfix_queue_length (unit: messages)\n"
@@ -641,6 +772,11 @@ def pick_metric_value(parsed: Dict[str, Any], args) -> Tuple[str, float]:
     # Filesystem by mount or fs
     if m in ("fs_used_pct", "fs_used_bytes", "fs_total_bytes", "fs_avail_bytes"):
         row = find_df_entry(parsed.get("df", []), mountpoint=args.mount, fs=args.fs)
+        # Fallback for fs_used_pct: if no selector provided, pick the worst-used filesystem
+        if not row and m == "fs_used_pct":
+            rows = parsed.get("df", []) or []
+            if rows:
+                row = max(rows, key=lambda r: (r.get("use_percent") is not None, r.get("use_percent", -1)))
         if not row:
             return (m, None)
         if m == "fs_used_pct":
@@ -675,13 +811,30 @@ def pick_metric_value(parsed: Dict[str, Any], args) -> Tuple[str, float]:
 
     # ZFS dataset metrics
     if m in ("dataset_used_pct", "dataset_used_bytes", "dataset_quota_bytes"):
-        usage = dataset_usage_from_zfsget(parsed.get("zfsget", {}), args.dataset, df_rows=parsed.get("df", [])) if args.dataset else {}
+        if args.dataset:
+            usage = dataset_usage_from_zfsget(parsed.get("zfsget", {}), args.dataset, df_rows=parsed.get("df", []))
+        else:
+            # Fallback to worst-used dataset across all
+            entries = all_datasets_usage(parsed.get("zfsget", {}), df_rows=parsed.get("df", []))
+            usage = None
+            if entries:
+                # choose by used_pct if available; otherwise by used_bytes
+                def _score(e):
+                    up = e.get("used_pct")
+                    return (up is not None, up if up is not None else -1, e.get("used_bytes") or -1)
+                worst = max(entries, key=_score)
+                usage = worst
+        if not usage:
+            return (m, None)
         if m == "dataset_used_pct":
-            return (m, float(usage.get("used_pct"))) if usage.get("used_pct") is not None else (m, None)
+            v = usage.get("used_pct")
+            return (m, float(v)) if v is not None else (m, None)
         if m == "dataset_used_bytes":
-            return (m, float(usage.get("used_bytes"))) if usage.get("used_bytes") is not None else (m, None)
+            v = usage.get("used_bytes")
+            return (m, float(v)) if v is not None else (m, None)
         if m == "dataset_quota_bytes":
-            return (m, float(usage.get("quota_bytes"))) if usage.get("quota_bytes") is not None else (m, None)
+            v = usage.get("quota_bytes")
+            return (m, float(v)) if v is not None else (m, None)
 
     if m == "all_datasets":
         entries = all_datasets_usage(parsed.get("zfsget", {}), df_rows=parsed.get("df", []))
@@ -868,8 +1021,15 @@ def parse_agent_output(raw: str) -> Dict[str, Any]:
         for name, data in pools.items():
             cap = data.get("cap_pct")
             health = (data.get("health") or "").upper()
-            if isinstance(cap, (int, float)):
-                worst = cap if worst is None else max(worst, cap)
+            try:
+                if isinstance(cap, str):
+                    # normalize possible comma decimals
+                    cap = cap.replace(",", ".").rstrip("% ")
+                if cap is not None and cap != "":
+                    capf = float(cap)
+                    worst = capf if worst is None else max(worst, capf)
+            except Exception:
+                pass
             if health and health not in ("ONLINE", "HEALTHY"):
                 unhealthy += 1
         result["zpool_summary"] = {"worst_cap_pct": worst, "unhealthy_count": unhealthy}
@@ -1016,13 +1176,9 @@ def main():
                 if value is None:
                     print("UNKNOWN - load not available | load1=NaN;;;; load5=NaN;;;; load15=NaN;;;;")
                     sys.exit(3)
-                state = 0
                 warn = args.warn
                 crit = args.crit
-                if crit is not None and value >= crit:
-                    state = 2
-                elif warn is not None and value >= warn:
-                    state = 1
+                state = _eval_thresh("load", value, warn, crit)
                 text = ["OK", "WARNING", "CRITICAL", "UNKNOWN"][state]
                 w = "" if warn is None else warn
                 c = "" if crit is None else crit
@@ -1063,14 +1219,9 @@ def main():
             return
 
         if args.format == "nagios":
-            # Higher-is-bad by default, except for availability we might invert later if needed.
-            state = 0
             warn = args.warn
             crit = args.crit
-            if crit is not None and value >= crit:
-                state = 2
-            elif warn is not None and value >= warn:
-                state = 1
+            state = _eval_thresh(label, value, warn, crit)
             text = ["OK", "WARNING", "CRITICAL", "UNKNOWN"][state]
             # Emit perfdata with warn/crit if provided
             w = "" if warn is None else warn
