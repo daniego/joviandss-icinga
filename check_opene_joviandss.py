@@ -30,7 +30,7 @@ from math import isfinite
 
 
 
-SECTION_RE = re.compile(r"<<<(?P<name>[a-zA-Z0-9_:-]+)>>>")
+SECTION_RE = re.compile(r"<<<(?P<name>[^>]+)>>>")
 
 # Helper to sanitize perfdata labels
 def _sanitize_label(s: str) -> str:
@@ -314,6 +314,9 @@ def parse_zpool_summary(block: List[str]) -> Dict[str, Dict[str, Any]]:
         return None
 
     for line in block:
+        # Skip accidental embedded section tags (if splitting ever misses them)
+        if line.strip().startswith("<<<") and line.strip().endswith(">>>"):
+            continue
         if not line.strip():
             continue
         parts = line.split()
@@ -328,6 +331,10 @@ def parse_zpool_summary(block: List[str]) -> Dict[str, Dict[str, Any]]:
             continue
         if header is None:
             # skip until header found
+            continue
+
+        # Require at least 3 tokens in data rows (name + at least two columns)
+        if len(parts) < 3:
             continue
 
         row = parts
@@ -348,44 +355,72 @@ def parse_zpool_summary(block: List[str]) -> Dict[str, Dict[str, Any]]:
             if "cap" in h.lower():
                 cap_idx = i
                 break
+
+        def _parse_cap_token(tok: str):
+            """Parse CAP token strictly as a percentage. Accept '12%', '12.3%', '12,3%' or bare numbers that are clearly percentages.
+            If a bare number is in [0,1], treat it as a ratio and scale by 100.
+            Reject tokens with non-numeric suffixes like '1.00x'."""
+            if not isinstance(tok, str):
+                return None
+            s = tok.strip()
+            # quick reject common non-percentage CAP-adjacent tokens
+            if s.lower().endswith("x"):  # e.g., '1.00x' (dedup ratio)
+                return None
+            if s in ("-", "na", "n/a", "", "NA", "N/A"):
+                return None
+            had_percent = s.endswith("%")
+            s = s[:-1] if had_percent else s
+            s = s.replace(",", ".")
+            # Reject if contains any alpha after stripping % (prevents units like 'T', 'G')
+            if re.search(r"[A-Za-z]", s):
+                return None
+            try:
+                v = float(s)
+            except Exception:
+                return None
+            # If we saw a percent sign, accept in 0..101
+            if had_percent:
+                if 0.0 <= v <= 101.0:
+                    return round(v, 2)
+                return None
+            # No percent sign: interpret heuristically
+            # - values in [0,1] -> ratio -> scale to %
+            # - values in (1, 101] -> already a percent
+            if 0.0 <= v <= 1.0:
+                return round(v * 100.0, 2)
+            if 0.0 < v <= 101.0:
+                return round(v, 2)
+            return None
+
+        # Parse from the CAP column if we found one
         if cap_idx is not None and cap_idx < len(row):
-            # first try the token at cap_idx
-            cap_pct = _tok_to_pct_loose(row[cap_idx])
-            # if it's like '-' try adjacent token(s) (some vendors split it oddly)
+            cap_pct = _parse_cap_token(row[cap_idx])
+            # Some odd outputs split CAP value across columns; try neighbors if needed
             if cap_pct is None:
                 if cap_idx + 1 < len(row):
-                    cap_pct = _tok_to_pct_loose(row[cap_idx + 1])
+                    cap_pct = _parse_cap_token(row[cap_idx + 1])
                 if cap_pct is None and cap_idx > 0:
-                    cap_pct = _tok_to_pct_loose(row[cap_idx - 1])
+                    cap_pct = _parse_cap_token(row[cap_idx - 1])
 
-        # 2) Fallback to common header names placed in the dict
+        # 2) Fallback to dict keys that look like capacity
         if cap_pct is None:
             for key in list(data.keys()):
                 lk = key.lower()
                 if lk in ("cap", "cap%", "capacity", "ckcap", "ckcap%"):
-                    cap_pct = _tok_to_pct_loose(data[key])
+                    cap_pct = _parse_cap_token(str(data[key]))
                     if cap_pct is not None:
                         break
 
-        # 3) Final fallback: pick the last token in the row that looks like a percentage/number
+        # 3) Final fallback: compute from alloc/size
         if cap_pct is None:
-            for tok in reversed(row):
-                pct = _tok_to_pct_loose(tok)
-                if pct is not None:
-                    cap_pct = pct
-                    break
-
-        # 4) Compute from alloc/size if still None and both columns exist
-        if cap_pct is None:
-            # find the column indexes for size and alloc if present
             size_idx = None
             alloc_idx = None
-            for i, h in enumerate(header):
-                hl = h.lower()
-                if size_idx is None and "size" in hl:
-                    size_idx = i
-                if alloc_idx is None and ("alloc" in hl or "allocated" in hl):
-                    alloc_idx = i
+            for i2, h2 in enumerate(header):
+                hl2 = h2.lower()
+                if size_idx is None and "size" in hl2:
+                    size_idx = i2
+                if alloc_idx is None and ("alloc" in hl2 or "allocated" in hl2):
+                    alloc_idx = i2
             try:
                 if size_idx is not None and alloc_idx is not None and size_idx < len(row) and alloc_idx < len(row):
                     size_b = parse_size_to_bytes(row[size_idx])
@@ -395,9 +430,50 @@ def parse_zpool_summary(block: List[str]) -> Dict[str, Dict[str, Any]]:
             except Exception:
                 pass
 
-        # Normalize health for downstream logic
+        # Normalize health and clamp cap_pct to [0, 100]
         if "health" in data:
             data["health"] = str(data["health"]).upper()
+        if cap_pct is not None:
+            try:
+                if cap_pct < 0:
+                    cap_pct = 0.0
+                elif cap_pct > 100:
+                    cap_pct = 100.0
+            except Exception:
+                pass
+
+        # Normalize/derive extra pool fields
+        size_b = parse_size_to_bytes(data.get("size")) if "size" in data else None
+        alloc_b = parse_size_to_bytes(data.get("alloc")) if "alloc" in data else None
+        free_b  = parse_size_to_bytes(data.get("free"))  if "free"  in data else None
+
+        # FRAG to percent
+        frag_pct = None
+        if "frag" in data and isinstance(data["frag"], str):
+            m = re.match(r"^\s*([0-9]*\.?[0-9]+)\s*%?\s*$", data["frag"])
+            if m:
+                try:
+                    frag_pct = float(m.group(1))
+                except Exception:
+                    frag_pct = None
+
+        # DEDUP to float (strip trailing 'x')
+        dedup_ratio = None
+        if "dedup" in data and isinstance(data["dedup"], str):
+            s = data["dedup"].strip()
+            if s.lower().endswith("x"):
+                s = s[:-1]
+            s = s.replace(",", ".")
+            try:
+                dedup_ratio = float(s)
+            except Exception:
+                dedup_ratio = None
+
+        if size_b is not None:   data["size_bytes"]  = size_b
+        if alloc_b is not None:  data["alloc_bytes"] = alloc_b
+        if free_b is not None:   data["free_bytes"]  = free_b
+        if frag_pct is not None: data["frag_pct"]    = frag_pct
+        if dedup_ratio is not None: data["dedup_ratio"] = dedup_ratio
 
         data["cap_pct"] = cap_pct
         pools[name] = data
@@ -717,7 +793,7 @@ METRIC_HELP_TEXT = (
     "  Filesystem summary (across all filesystems):\n"
     "    df_used_pct (unit: %) | df_used_bytes (unit: B) | df_total_bytes (unit: B) | filesystem_count (unit: count)\n"
     "  ZFS ARC cache: arc_size_bytes | arc_compressed_size_bytes | arc_uncompressed_size_bytes | l2_size_bytes | l2_asize_bytes | arc_hit_ratio (unit: %, warn/crit are minimums) | l2_hit_ratio (unit: %, warn/crit are minimums)\n"
-    "  ZFS pools: zpool_worst_cap_pct (unit: %) | zpool_unhealthy_count (unit: pools) | zpool_pool_cap_pct (requires --pool, unit: %)\n"
+    "  ZFS pools: zpool_worst_cap_pct (unit: %, Nagios includes per-pool SIZE/ALLOC/FREE/FRAG/CAP/DEDUP/HEALTH text + perfdata) | zpool_unhealthy_count (unit: pools) | zpool_pool_cap_pct (requires --pool, unit: %)\n"
     "  ZFS datasets (require --dataset for a specific dataset). If omitted, dataset_* defaults to the worst-used dataset:\n"
     "    dataset_used_pct (unit: %) | dataset_used_bytes (unit: B) | dataset_quota_bytes (unit: B) | all_datasets\n"
     "  Plugins/inventory: plugins_count (unit: count)\n"
@@ -1021,15 +1097,23 @@ def parse_agent_output(raw: str) -> Dict[str, Any]:
         for name, data in pools.items():
             cap = data.get("cap_pct")
             health = (data.get("health") or "").upper()
+            # Accept numeric cap only, clamp to [0, 100]
+            capf = None
             try:
                 if isinstance(cap, str):
-                    # normalize possible comma decimals
                     cap = cap.replace(",", ".").rstrip("% ")
+                    if re.search(r"[A-Za-z]", cap):
+                        cap = None
                 if cap is not None and cap != "":
                     capf = float(cap)
-                    worst = capf if worst is None else max(worst, capf)
+                    if capf < 0:
+                        capf = 0.0
+                    elif capf > 100:
+                        capf = 100.0
             except Exception:
-                pass
+                capf = None
+            if capf is not None:
+                worst = capf if worst is None else max(worst, capf)
             if health and health not in ("ONLINE", "HEALTHY"):
                 unhealthy += 1
         result["zpool_summary"] = {"worst_cap_pct": worst, "unhealthy_count": unhealthy}
@@ -1216,6 +1300,73 @@ def main():
 
         if args.format == "kv":
             print(f"{label}={value}")
+            return
+
+        # Special Nagios formatting for zpool_worst_cap_pct: include per-pool details & perfdata
+        if args.metric == "zpool_worst_cap_pct" and args.format == "nagios":
+            pools = parsed.get("zpool") or {}
+            if value is None or not pools:
+                print("UNKNOWN - zpool_worst_cap_pct not available | zpool_worst_cap_pct=NaN;;;;")
+                sys.exit(3)
+
+            # Identify worst pool by CAP
+            worst_name, worst_val = None, None
+            for pname, pdata in pools.items():
+                cap = pdata.get("cap_pct")
+                try:
+                    capf = float(cap) if cap is not None else None
+                except Exception:
+                    capf = None
+                if capf is not None and (worst_val is None or capf > worst_val):
+                    worst_name, worst_val = pname, capf
+            if worst_val is None:
+                worst_val = float(value)
+
+            warn, crit = args.warn, args.crit
+            state = _eval_thresh("zpool_worst_cap_pct", worst_val, warn, crit)
+            text = ["OK", "WARNING", "CRITICAL", "UNKNOWN"][state]
+            w = "" if warn is None else warn
+            c = "" if crit is None else crit
+
+            # Human summary and perfdata
+            human_bits = []
+            perf = [f"zpool_worst_cap_pct={worst_val};{w};{c}"]
+
+            for pname, pdata in pools.items():
+                # Only include entries that look like real zpool rows (must have SIZE/ALLOC/FREE or CAP)
+                looks_like_pool = any(k in pdata for k in ("size", "alloc", "free", "cap", "cap_pct"))
+                if not looks_like_pool:
+                    continue
+                base = _sanitize_label(pname)
+
+                cap   = pdata.get("cap_pct")
+                frag  = pdata.get("frag_pct")
+                dedup = pdata.get("dedup_ratio")
+                sizeb = pdata.get("size_bytes")
+                alloc = pdata.get("alloc_bytes")
+                freeb = pdata.get("free_bytes")
+
+                ckpoint  = pdata.get("ckpoint")  or "-"
+                expandsz = pdata.get("expandsz") or "-"
+                health   = pdata.get("health")   or "NA"
+                altroot  = pdata.get("altroot")  or "-"
+
+                human_bits.append(
+                    f"{pname} SIZE={pdata.get('size','-')} ALLOC={pdata.get('alloc','-')} FREE={pdata.get('free','-')} "
+                    f"CKPOINT={ckpoint} EXPANDSZ={expandsz} FRAG={pdata.get('frag','-')} CAP={pdata.get('cap','-')} "
+                    f"DEDUP={pdata.get('dedup','-')} HEALTH={health} ALTROOT={altroot}"
+                )
+
+                if cap   is not None: perf.append(f"{base}_cap_pct={cap};{w};{c}")
+                if frag  is not None: perf.append(f"{base}_frag_pct={frag};;;")
+                if dedup is not None: perf.append(f"{base}_dedup_ratio={dedup};;;")
+                if sizeb is not None: perf.append(f"{base}_size_bytes={int(sizeb)}B;;;")
+                if alloc is not None: perf.append(f"{base}_alloc_bytes={int(alloc)}B;;;")
+                if freeb is not None: perf.append(f"{base}_free_bytes={int(freeb)}B;;;")
+
+            summary_text = " || ".join(human_bits)
+            print(f"{text} - worst pool {worst_name} at {worst_val}% :: {summary_text} | " + " ".join(perf))
+            sys.exit(state)
             return
 
         if args.format == "nagios":
