@@ -53,7 +53,7 @@ python3 check_opene_joviandss.py --input-file samples/checkmk_output.txt --metri
 ### Available Metrics
 
 - **CPU:**
-  - `load1`, `load5`, `load15` (unit: load average)
+  - `load` (unit: load average, includes load1/load5/load15; thresholds apply to load1)
 - **Uptime:**
   - `uptime_seconds`, `idle_seconds` (unit: seconds)
 - **Memory:**
@@ -89,7 +89,7 @@ python3 check_opene_joviandss.py --input-file samples/checkmk_output.txt --metri
 
 | Metric               | Description                               | Unit           |
 |----------------------|-------------------------------------------|----------------|
-| load1/load5/load15   | CPU load average                          | load           |
+| load                 | CPU load average (includes load1/load5/load15; thresholds apply to load1) | load           |
 | uptime_seconds       | System uptime                             | seconds        |
 | idle_seconds         | System idle time                          | seconds        |
 | mem_used_pct         | Memory used                               | %              |
@@ -138,6 +138,12 @@ python3 check_opene_joviandss.py --input-file samples/checkmk_output.txt --metri
 - `value`: print only the numeric value
 - `kv`: print as metric=value
 - `nagios`: plugin-compatible output with perfdata
+
+### Thresholds
+- For the `nagios` format, you can pass `--warn` and `--crit` thresholds.
+- Thresholds are evaluated against the main numeric value of the metric.
+- For `load`, thresholds apply to the 1-minute load average (`load1`).
+- Other metrics (like percentages) compare directly to the numeric value.
 
 ### Icinga2 Integration
 

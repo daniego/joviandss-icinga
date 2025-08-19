@@ -576,7 +576,7 @@ def find_df_entry(df_rows: List[Dict[str, Any]], *, mountpoint: str = None, fs: 
 # ---- Metric documentation block ----
 METRIC_HELP_TEXT = (
     "Supported metrics (use with --metric):\n"
-    "  CPU: load1 | load5 | load15 (unit: load avg)\n"
+    "  CPU: load (1,5,15) (unit: load avg)\n"
     "  Uptime: uptime_seconds | idle_seconds (unit: seconds)\n"
     "  Memory: mem_used_pct (unit: %) | mem_used_bytes (unit: B) | mem_total_bytes (unit: B)\n"
     "  Processes: process_count (unit: count)\n"
@@ -601,7 +601,12 @@ def pick_metric_value(parsed: Dict[str, Any], args) -> Tuple[str, float]:
     if not m:
         return (None, None)
 
-    # CPU loads
+    # Unified CPU load metric: returns load1 as the primary numeric value
+    if m == "load":
+        val = parsed.get("cpu", {}).get("load1")
+        return ("load", float(val)) if val is not None else ("load", None)
+
+    # (Legacy) individual CPU load metrics
     if m in ("load1", "load5", "load15"):
         val = parsed.get("cpu", {}).get(m)
         return (m, float(val)) if val is not None else (m, None)
@@ -985,6 +990,52 @@ def main():
                 print(f"{text} - worst dataset {worst_ds} at {worst_pct}% | " + " ".join(perf_parts))
                 sys.exit(state)
                 return
+
+        # Special handling for the unified 'load' metric
+        if args.metric == "load":
+            cpu = parsed.get("cpu", {}) or {}
+            l1 = cpu.get("load1")
+            l5 = cpu.get("load5")
+            l15 = cpu.get("load15")
+            # JSON returns all three values
+            if args.format == "json":
+                out = {"metric": "load", "value": {"load1": l1, "load5": l5, "load15": l15}, "source": "agent"}
+                print(json.dumps(out, indent=2 if args.pretty else None))
+                return
+            # KV prints all three keys
+            if args.format == "kv":
+                parts = []
+                parts.append(f"load1={l1 if l1 is not None else 'NaN'}")
+                parts.append(f"load5={l5 if l5 is not None else 'NaN'}")
+                parts.append(f"load15={l15 if l15 is not None else 'NaN'}")
+                print(" ".join(parts))
+                return
+            # Nagios: evaluate thresholds against load1, but expose all three as perfdata
+            if args.format == "nagios":
+                value = l1
+                if value is None:
+                    print("UNKNOWN - load not available | load1=NaN;;;; load5=NaN;;;; load15=NaN;;;;")
+                    sys.exit(3)
+                state = 0
+                warn = args.warn
+                crit = args.crit
+                if crit is not None and value >= crit:
+                    state = 2
+                elif warn is not None and value >= warn:
+                    state = 1
+                text = ["OK", "WARNING", "CRITICAL", "UNKNOWN"][state]
+                w = "" if warn is None else warn
+                c = "" if crit is None else crit
+                perf = [
+                    f"load1={value};{w};{c}",
+                    f"load5={l5 if l5 is not None else 'NaN'};{w};{c}",
+                    f"load15={l15 if l15 is not None else 'NaN'};{w};{c}",
+                ]
+                print(f"{text} - load={value} | " + " ".join(perf))
+                sys.exit(state)
+                return
+            # For 'value' (and any other fallthrough), we already picked load1 in pick_metric_value
+
         if args.format == "json":
             out = {"metric": label, "value": value, "source": "agent", "context": {
                 "mount": args.mount, "fs": args.fs, "dataset": args.dataset
