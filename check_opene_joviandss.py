@@ -154,6 +154,155 @@ def split_sections(raw: str) -> List[Tuple[str, List[str]]]:
     return out
 
 
+
+# ----------- Additional specific decoders -----------
+
+def parse_tcp_conn_stats(block: List[str]) -> Dict[str, int]:
+    """
+    Parse lines like "01 4692" where the first field is the TCP state in hex as
+    in /proc/net/tcp and the second field is the count. Returns a dict with
+    human-readable keys such as tcp_established, tcp_time_wait, etc.
+    """
+    state_map = {
+        "01": "established",
+        "02": "syn_sent",
+        "03": "syn_recv",
+        "04": "fin_wait1",
+        "05": "fin_wait2",
+        "06": "time_wait",
+        "07": "close",
+        "08": "close_wait",
+        "09": "last_ack",
+        "0A": "listen",
+        "0B": "closing",
+    }
+    out: Dict[str, int] = {}
+    for line in block:
+        parts = line.strip().split()
+        if len(parts) != 2:
+            continue
+        code, cnt = parts[0].upper(), parts[1]
+        if code in state_map:
+            try:
+                out[f"tcp_{state_map[code]}"] = int(cnt)
+            except ValueError:
+                pass
+    return out
+
+
+def parse_zfs_arc_cache(block: List[str]) -> Dict[str, Any]:
+    """
+    Parse the zfs_arc_cache section of key = value lines. Returns numeric values
+    where possible and computes hit ratios if hits/misses are present.
+    """
+    kv: Dict[str, Any] = {}
+    for line in block:
+        if "=" not in line:
+            continue
+        k, v = [s.strip() for s in line.split("=", 1)]
+        # convert underscores to safer keys
+        key = k.lower().strip()
+        # numeric? allow integers only to avoid unit mishaps
+        try:
+            if v.lower().endswith("b") and v[:-1].strip().isdigit():
+                # unlikely format, but strip trailing 'B'
+                num = int(v[:-1].strip())
+            else:
+                num = int(v)
+            kv[key] = num
+        except Exception:
+            # keep raw string as fallback
+            kv[key] = v
+    # Derive ratios if possible
+    try:
+        hits = int(kv.get("hits"))
+        misses = int(kv.get("misses"))
+        total = hits + misses
+        if total > 0:
+            kv["arc_hit_ratio"] = round(100.0 * hits / total, 2)
+    except Exception:
+        pass
+    try:
+        l2_hits = int(kv.get("l2_hits"))
+        l2_misses = int(kv.get("l2_misses"))
+        total2 = l2_hits + l2_misses
+        if total2 > 0:
+            kv["l2_hit_ratio"] = round(100.0 * l2_hits / total2, 2)
+    except Exception:
+        pass
+    return kv
+
+
+def parse_zpool_summary(block: List[str]) -> Dict[str, Dict[str, Any]]:
+    """
+    Parse the compact zpool summary table (with headers like: name size alloc free ckCap frag cap dedup health altroot)
+    Returns mapping: {pool_name: {"cap_pct": float, "health": str, "size": str, "alloc": str, ...}}
+    Numeric percentages are returned without the '%' sign as floats.
+    """
+    pools: Dict[str, Dict[str, Any]] = {}
+    header = None
+    for line in block:
+        if not line.strip():
+            continue
+        parts = line.split()
+        if not parts:
+            continue
+        # detect header row (contains 'name' and 'health')
+        if ("name" in parts) and ("health" in parts):
+            header = parts
+            continue
+        if header is None:
+            # skip until header found
+            continue
+        # align to header length; some fields like 'altroot' may be missing
+        row = parts
+        name = row[0]
+        # Build a dict aligning by index when header is known
+        data: Dict[str, Any] = {}
+        for i, h in enumerate(header[1:], start=1):
+            if i < len(row):
+                data[h] = row[i]
+        # Normalize cap -> cap_pct
+        cap_raw = data.get("cap") or data.get("ckCap") or data.get("capacity")
+        cap_pct = None
+        if isinstance(cap_raw, str):
+            m = re.match(r"(\d+(?:\.\d+)?)%", cap_raw)
+            if m:
+                cap_pct = float(m.group(1))
+        data["cap_pct"] = cap_pct
+        pools[name] = data
+    return pools
+
+
+def parse_lnx_if_upcount(block: List[str]) -> int:
+    """
+    Count interfaces with state UP from `ip -o link`-style lines in lnx_if.
+    """
+    cnt = 0
+    for line in block:
+        if ":" in line and "state UP" in line:
+            cnt += 1
+    return cnt
+
+
+def parse_postfix_mailq(block: List[str]) -> int:
+    """
+    Return the number of queued mails if present, else 0 when 'Mail queue is empty'.
+    """
+    text = "\n".join(block)
+    if "Mail queue is empty" in text:
+        return 0
+    # Look for lines like "-- 10 Kbytes in 5 Requests."
+    m = re.search(r"(\d+)\s+Requests", text)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            pass
+    # Fallback: unknown -> None
+    return None
+
+
 # ----------- Specific decoders for known sections -----------
 
 def parse_keyval_kb(block: List[str]) -> Dict[str, int]:
@@ -427,17 +576,21 @@ def find_df_entry(df_rows: List[Dict[str, Any]], *, mountpoint: str = None, fs: 
 # ---- Metric documentation block ----
 METRIC_HELP_TEXT = (
     "Supported metrics (use with --metric):\n"
-    "  CPU: load1 | load5 | load15\n"
-    "  Uptime: uptime_seconds | idle_seconds\n"
-    "  Memory: mem_used_pct | mem_used_bytes | mem_total_bytes\n"
-    "  Processes: process_count\n"
+    "  CPU: load1 | load5 | load15 (unit: load avg)\n"
+    "  Uptime: uptime_seconds | idle_seconds (unit: seconds)\n"
+    "  Memory: mem_used_pct (unit: %) | mem_used_bytes (unit: B) | mem_total_bytes (unit: B)\n"
+    "  Processes: process_count (unit: count)\n"
+    "  TCP connections: tcp_established | tcp_syn_sent | tcp_syn_recv | tcp_fin_wait1 | tcp_fin_wait2 | tcp_time_wait | tcp_close | tcp_close_wait | tcp_last_ack | tcp_listen | tcp_closing (unit: sockets)\n"
     "  Filesystem-by-mount or fs name (require --mount or --fs):\n"
-    "    fs_used_pct | fs_used_bytes | fs_total_bytes | fs_avail_bytes\n"
+    "    fs_used_pct (unit: %) | fs_used_bytes (unit: B) | fs_total_bytes (unit: B) | fs_avail_bytes (unit: B)\n"
     "  Filesystem summary (across all filesystems):\n"
-    "    df_used_pct | df_used_bytes | df_total_bytes | filesystem_count\n"
+    "    df_used_pct (unit: %) | df_used_bytes (unit: B) | df_total_bytes (unit: B) | filesystem_count (unit: count)\n"
+    "  ZFS ARC cache: arc_size_bytes | arc_compressed_size_bytes | arc_uncompressed_size_bytes | l2_size_bytes | l2_asize_bytes | arc_hit_ratio (unit: %) | l2_hit_ratio (unit: %)\n"
+    "  ZFS pools: zpool_worst_cap_pct (unit: %) | zpool_unhealthy_count (unit: pools) | zpool_pool_cap_pct (requires --pool, unit: %)\n"
     "  ZFS datasets (require --dataset for single dataset):\n"
-    "    dataset_used_pct | dataset_used_bytes | dataset_quota_bytes | all_datasets\n"
-    "  Plugins/inventory: plugins_count\n"
+    "    dataset_used_pct (unit: %) | dataset_used_bytes (unit: B) | dataset_quota_bytes (unit: B) | all_datasets\n"
+    "  Plugins/inventory: plugins_count (unit: count)\n"
+    "  Mail: postfix_queue_length (unit: messages)\n"
 )
 
 def pick_metric_value(parsed: Dict[str, Any], args) -> Tuple[str, float]:
@@ -537,6 +690,51 @@ def pick_metric_value(parsed: Dict[str, Any], args) -> Tuple[str, float]:
             val = None
         return (m, float(val)) if val is not None else (m, None)
 
+    # TCP connection states
+    if m.startswith("tcp_"):
+        val = (parsed.get("tcp_conn_stats") or {}).get(m)
+        return (m, float(val)) if val is not None else (m, None)
+
+    # ZFS ARC cache metrics
+    if m in ("arc_size_bytes", "arc_compressed_size_bytes", "arc_uncompressed_size_bytes", "l2_size_bytes", "l2_asize_bytes", "arc_hit_ratio", "l2_hit_ratio"):
+        key_map = {
+            "arc_size_bytes": "size",
+            "arc_compressed_size_bytes": "compressed_size",
+            "arc_uncompressed_size_bytes": "uncompressed_size",
+            "l2_size_bytes": "l2_size",
+            "l2_asize_bytes": "l2_asize",
+            "arc_hit_ratio": "arc_hit_ratio",
+            "l2_hit_ratio": "l2_hit_ratio",
+        }
+        k = key_map[m]
+        val = (parsed.get("zfs_arc_cache") or {}).get(k)
+        return (m, float(val)) if val is not None else (m, None)
+
+    # ZFS pool metrics
+    if m == "zpool_worst_cap_pct":
+        val = (parsed.get("zpool_summary") or {}).get("worst_cap_pct")
+        return (m, float(val)) if val is not None else (m, None)
+    if m == "zpool_unhealthy_count":
+        val = (parsed.get("zpool_summary") or {}).get("unhealthy_count")
+        return (m, float(val)) if val is not None else (m, None)
+    if m == "zpool_pool_cap_pct":
+        pools = parsed.get("zpool", {})
+        p = args.pool
+        if not (p and p in pools):
+            return (m, None)
+        val = pools[p].get("cap_pct")
+        return (m, float(val)) if val is not None else (m, None)
+
+    # Network interfaces
+    if m == "net_up_if_count":
+        val = (parsed.get("net_if") or {}).get("up_count")
+        return (m, float(val)) if val is not None else (m, None)
+
+    # Mail queue size
+    if m == "postfix_queue_length":
+        val = (parsed.get("postfix") or {}).get("queue_length")
+        return (m, float(val)) if val is not None else (m, None)
+
     return (m, None)
 
 
@@ -605,6 +803,28 @@ def parse_agent_output(raw: str) -> Dict[str, Any]:
                 "entries": (prev.get("entries") or []) + parsed["entries"],
             }
 
+        elif name.startswith("tcp_conn_stats"):
+            result["tcp_conn_stats"] = parse_tcp_conn_stats(lines)
+
+        elif name == "zfs_arc_cache":
+            result["zfs_arc_cache"] = parse_zfs_arc_cache(lines)
+
+        elif name == "zpool":
+            result["zpool"] = parse_zpool_summary(lines)
+
+        elif name == "zpool_status":
+            # Not strictly needed if summary provides health, but we keep count of non-ONLINE as a safeguard
+            text = "\n".join(lines)
+            # crude detection: if any line "state: <STATE>" and STATE != ONLINE, we will later count it
+            result.setdefault("_zpool_status_text", text)
+
+        elif name == "lnx_if":
+            result["net_if"] = {"up_count": parse_lnx_if_upcount(lines)}
+
+        elif name == "postfix_mailq":
+            q = parse_postfix_mailq(lines)
+            result["postfix"] = {"queue_length": q}
+
         # You can add more section decoders here if needed.
 
         i += 1
@@ -634,6 +854,32 @@ def parse_agent_output(raw: str) -> Dict[str, Any]:
                 "used_bytes": used,
                 "used_pct": round(100.0 * used / total, 2),
             }
+
+    # Zpool derived summary
+    if "zpool" in result:
+        pools = result["zpool"] or {}
+        worst = None
+        unhealthy = 0
+        for name, data in pools.items():
+            cap = data.get("cap_pct")
+            health = (data.get("health") or "").upper()
+            if isinstance(cap, (int, float)):
+                worst = cap if worst is None else max(worst, cap)
+            if health and health not in ("ONLINE", "HEALTHY"):
+                unhealthy += 1
+        result["zpool_summary"] = {"worst_cap_pct": worst, "unhealthy_count": unhealthy}
+
+    # Normalize key names for ARC sizes to *_bytes for metric picker
+    if "zfs_arc_cache" in result:
+        arc = result["zfs_arc_cache"]
+        # ensure numeric type for size-like fields
+        for k in ("size", "compressed_size", "uncompressed_size", "l2_size", "l2_asize"):
+            v = arc.get(k)
+            try:
+                if isinstance(v, str) and v.isdigit():
+                    arc[k] = int(v)
+            except Exception:
+                pass
 
     # Convenience dataset summaries (no change to existing returns, just keep as is)
     # (No code needed here per instructions)
@@ -668,6 +914,7 @@ def main():
     ap.add_argument("--mount", help="Mountpoint for fs_* metrics (use with --metric fs_used_pct).")
     ap.add_argument("--fs", help="Filesystem/device name for fs_* metrics (alternative to --mount).")
     ap.add_argument("--dataset", help="ZFS dataset name for dataset_* metrics.")
+    ap.add_argument("--pool", help="ZFS pool name for zpool_* metrics.")
     ap.add_argument("--warn", type=float, help="Warning threshold (used with --format nagios).")
     ap.add_argument("--crit", type=float, help="Critical threshold (used with --format nagios).")
 

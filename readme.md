@@ -74,6 +74,16 @@ python3 check_opene_joviandss.py --input-file samples/checkmk_output.txt --metri
   - `all_datasets` (unit: list / % when summarized)
 - **Plugins:**
   - `plugins_count` (unit: count)
+- **TCP connections:**
+  - `tcp_established`, `tcp_syn_sent`, `tcp_syn_recv`, `tcp_fin_wait1`, `tcp_fin_wait2`, `tcp_time_wait`, `tcp_close`, `tcp_close_wait`, `tcp_last_ack`, `tcp_listen`, `tcp_closing` (unit: sockets)
+- **ZFS ARC cache:**
+  - `arc_size_bytes`, `arc_compressed_size_bytes`, `arc_uncompressed_size_bytes`, `l2_size_bytes`, `l2_asize_bytes`, `arc_hit_ratio`, `l2_hit_ratio`
+- **ZFS pools:**
+  - `zpool_worst_cap_pct`, `zpool_unhealthy_count`, `zpool_pool_cap_pct` (requires --pool)
+- **Network interfaces:**
+  - `net_up_if_count` (unit: count)
+- **Mail queue:**
+  - `postfix_queue_length` (unit: messages)
 
 ### Metrics and Units Table
 
@@ -99,6 +109,29 @@ python3 check_opene_joviandss.py --input-file samples/checkmk_output.txt --metri
 | dataset_quota_bytes  | ZFS dataset quota                         | bytes          |
 | all_datasets         | All ZFS datasets (summary/worst %)        | % or list      |
 | plugins_count        | Plugins count                             | count          |
+| tcp_established      | TCP established connections               | sockets        |
+| tcp_syn_sent         | TCP SYN sent connections                   | sockets        |
+| tcp_syn_recv         | TCP SYN received connections               | sockets        |
+| tcp_fin_wait1        | TCP FIN-WAIT1 connections                  | sockets        |
+| tcp_fin_wait2        | TCP FIN-WAIT2 connections                  | sockets        |
+| tcp_time_wait        | TCP TIME-WAIT connections                  | sockets        |
+| tcp_close            | TCP CLOSE state                            | sockets        |
+| tcp_close_wait       | TCP CLOSE-WAIT state                       | sockets        |
+| tcp_last_ack         | TCP LAST-ACK state                         | sockets        |
+| tcp_listen           | TCP LISTEN sockets                         | sockets        |
+| tcp_closing          | TCP CLOSING state                          | sockets        |
+| arc_size_bytes       | ZFS ARC size                              | bytes          |
+| arc_compressed_size_bytes | ZFS ARC compressed size                 | bytes          |
+| arc_uncompressed_size_bytes | ZFS ARC uncompressed size             | bytes          |
+| l2_size_bytes        | ZFS L2ARC size                            | bytes          |
+| l2_asize_bytes       | ZFS L2ARC allocated size                  | bytes          |
+| arc_hit_ratio        | ZFS ARC hit ratio                         | %              |
+| l2_hit_ratio         | ZFS L2ARC hit ratio                       | %              |
+| zpool_worst_cap_pct  | Worst capacity across pools               | %              |
+| zpool_unhealthy_count| Unhealthy pool count                      | pools          |
+| zpool_pool_cap_pct   | Capacity of specified pool                | %              |
+| net_up_if_count      | Interfaces in UP state                     | count          |
+| postfix_queue_length | Postfix queue length                      | messages       |
 
 ### Output formats
 - `json`: full JSON result
@@ -163,4 +196,3 @@ python3 check_opene_joviandss.py --input-file samples/output.txt --metric proces
 
 ### License
 MIT License. Contributions welcome!
-
