@@ -423,32 +423,99 @@ def find_df_entry(df_rows: List[Dict[str, Any]], *, mountpoint: str = None, fs: 
             return row
     return {}
 
+
+# ---- Metric documentation block ----
+METRIC_HELP_TEXT = (
+    "Supported metrics (use with --metric):\n"
+    "  CPU: load1 | load5 | load15\n"
+    "  Uptime: uptime_seconds | idle_seconds\n"
+    "  Memory: mem_used_pct | mem_used_bytes | mem_total_bytes\n"
+    "  Processes: process_count\n"
+    "  Filesystem-by-mount or fs name (require --mount or --fs):\n"
+    "    fs_used_pct | fs_used_bytes | fs_total_bytes | fs_avail_bytes\n"
+    "  Filesystem summary (across all filesystems):\n"
+    "    df_used_pct | df_used_bytes | df_total_bytes | filesystem_count\n"
+    "  ZFS datasets (require --dataset for single dataset):\n"
+    "    dataset_used_pct | dataset_used_bytes | dataset_quota_bytes | all_datasets\n"
+    "  Plugins/inventory: plugins_count\n"
+)
+
 def pick_metric_value(parsed: Dict[str, Any], args) -> Tuple[str, float]:
     """
     Returns (label, value) for the requested metric.
-    Supported metrics:
-      - load1, load5, load15
-      - mem_used_pct
-      - uptime_seconds
-      - fs_used_pct  (requires --mount or --fs)
-      - dataset_used_pct (requires --dataset)
-      - dataset_used_bytes / dataset_quota_bytes (requires --dataset)
-      - all_datasets (returns list of dicts; best used with --format json)
     """
     m = args.metric
+    if not m:
+        return (None, None)
+
+    # CPU loads
     if m in ("load1", "load5", "load15"):
         val = parsed.get("cpu", {}).get(m)
         return (m, float(val)) if val is not None else (m, None)
-    if m == "mem_used_pct":
-        val = parsed.get("mem_summary", {}).get("used_pct")
-        return (m, float(val)) if val is not None else (m, None)
+
+    # Uptime
     if m == "uptime_seconds":
         val = parsed.get("uptime", {}).get("uptime_seconds")
         return (m, float(val)) if val is not None else (m, None)
-    if m == "fs_used_pct":
+    if m == "idle_seconds":
+        val = parsed.get("uptime", {}).get("idle_seconds")
+        return (m, float(val)) if val is not None else (m, None)
+
+    # Memory
+    if m == "mem_used_pct":
+        val = parsed.get("mem_summary", {}).get("used_pct")
+        return (m, float(val)) if val is not None else (m, None)
+    if m == "mem_used_bytes":
+        val = parsed.get("mem_summary", {}).get("used_bytes")
+        return (m, float(val)) if val is not None else (m, None)
+    if m == "mem_total_bytes":
+        val = parsed.get("mem_summary", {}).get("total_bytes")
+        return (m, float(val)) if val is not None else (m, None)
+
+    # Processes
+    if m == "process_count":
+        try:
+            val = len(parsed.get("ps_lnx", {}).get("lines", []) or [])
+        except Exception:
+            val = None
+        return (m, float(val)) if val is not None else (m, None)
+
+    # Filesystem by mount or fs
+    if m in ("fs_used_pct", "fs_used_bytes", "fs_total_bytes", "fs_avail_bytes"):
         row = find_df_entry(parsed.get("df", []), mountpoint=args.mount, fs=args.fs)
-        val = row.get("use_percent") if row else None
-        return ("fs_used_pct", float(val)) if val is not None else ("fs_used_pct", None)
+        if not row:
+            return (m, None)
+        if m == "fs_used_pct":
+            val = row.get("use_percent")
+            return (m, float(val)) if val is not None else (m, None)
+        if m == "fs_used_bytes":
+            val = row.get("used_bytes")
+            return (m, float(val)) if val is not None else (m, None)
+        if m == "fs_total_bytes":
+            val = row.get("size_bytes")
+            return (m, float(val)) if val is not None else (m, None)
+        if m == "fs_avail_bytes":
+            val = row.get("avail_bytes")
+            return (m, float(val)) if val is not None else (m, None)
+
+    # Filesystem summary across all
+    if m == "df_used_pct":
+        val = parsed.get("df_summary", {}).get("used_pct")
+        return (m, float(val)) if val is not None else (m, None)
+    if m == "df_used_bytes":
+        val = parsed.get("df_summary", {}).get("used_bytes")
+        return (m, float(val)) if val is not None else (m, None)
+    if m == "df_total_bytes":
+        val = parsed.get("df_summary", {}).get("total_bytes")
+        return (m, float(val)) if val is not None else (m, None)
+    if m == "filesystem_count":
+        try:
+            val = len(parsed.get("df", []) or [])
+        except Exception:
+            val = None
+        return (m, float(val)) if val is not None else (m, None)
+
+    # ZFS dataset metrics
     if m in ("dataset_used_pct", "dataset_used_bytes", "dataset_quota_bytes"):
         usage = dataset_usage_from_zfsget(parsed.get("zfsget", {}), args.dataset, df_rows=parsed.get("df", [])) if args.dataset else {}
         if m == "dataset_used_pct":
@@ -457,9 +524,19 @@ def pick_metric_value(parsed: Dict[str, Any], args) -> Tuple[str, float]:
             return (m, float(usage.get("used_bytes"))) if usage.get("used_bytes") is not None else (m, None)
         if m == "dataset_quota_bytes":
             return (m, float(usage.get("quota_bytes"))) if usage.get("quota_bytes") is not None else (m, None)
+
     if m == "all_datasets":
         entries = all_datasets_usage(parsed.get("zfsget", {}), df_rows=parsed.get("df", []))
         return (m, entries if entries is not None else None)
+
+    # Plugins / inventory
+    if m == "plugins_count":
+        try:
+            val = len((parsed.get("plugins") or {}).get("entries", []) or [])
+        except Exception:
+            val = None
+        return (m, float(val)) if val is not None else (m, None)
+
     return (m, None)
 
 
@@ -565,7 +642,7 @@ def parse_agent_output(raw: str) -> Dict[str, Any]:
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Fetch and parse Checkmk agent output from Open-E (supports --format and metric selection)")
+    ap = argparse.ArgumentParser(description="Fetch and parse Checkmk agent output from Open-E. Supports JSON, single-value outputs, and a rich set of --metric selections (see --metric help).")
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument("--input-file", help="Parse from local file (saved agent output)")
     src.add_argument("--host", help="SSH host/IP of Open-E")
@@ -579,10 +656,15 @@ def main():
 
     ap.add_argument("--pretty", action="store_true", help="Pretty-print JSON")
     ap.add_argument("--format", choices=["json", "value", "kv", "nagios"], default="json",
-                    help="Output format. 'json' (default) prints the full parsed JSON. "
-                         "'value' prints only the metric value. 'kv' prints 'name=value'. "
-                         "'nagios' prints a single-line status with perfdata (requires --metric).")
-    ap.add_argument("--metric", help="Select a specific metric to output. See --help for supported names. The special metric 'all_datasets' returns a JSON structure with every dataset's usage/quota.")
+                    help="Output format. 'json' (default) prints the full parsed JSON. 'value' prints only the metric value. 'kv' prints 'name=value'. 'nagios' prints a single-line status with perfdata (requires --metric).")
+    ap.add_argument(
+        "--metric",
+        help=(
+            "Select a specific metric to output. "
+            "The special metric 'all_datasets' returns a JSON structure with every dataset's usage/quota.\n\n"
+            + METRIC_HELP_TEXT
+        ),
+    )
     ap.add_argument("--mount", help="Mountpoint for fs_* metrics (use with --metric fs_used_pct).")
     ap.add_argument("--fs", help="Filesystem/device name for fs_* metrics (alternative to --mount).")
     ap.add_argument("--dataset", help="ZFS dataset name for dataset_* metrics.")
