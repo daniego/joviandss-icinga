@@ -48,7 +48,7 @@ def _eval_thresh(metric_name: str, value: float, warn: float, crit: float) -> in
     if value is None:
         return 3
 
-    LOWER_IS_BAD = {"arc_hit_ratio", "l2_hit_ratio"}
+    LOWER_IS_BAD = {"arc_hit_ratio", "l2_hit_ratio", "uptime_hours"}
 
     if metric_name in LOWER_IS_BAD:
         if crit is not None and value <= crit:
@@ -784,7 +784,7 @@ def find_df_entry(df_rows: List[Dict[str, Any]], *, mountpoint: str = None, fs: 
 METRIC_HELP_TEXT = (
     "Supported metrics (use with --metric):\n"
     "  CPU: load (1,5,15) (unit: load avg)\n"
-    "  Uptime: uptime_seconds | idle_seconds (unit: seconds)\n"
+    "  Uptime: uptime_hours (unit: hours; lower is bad) | uptime_seconds | idle_seconds (unit: seconds)\n"
     "  Memory: mem_used_pct (unit: %) | mem_used_bytes (unit: B) | mem_total_bytes (unit: B)\n"
     "  Processes: process_count (unit: count)\n"
     "  TCP connections: tcp_established | tcp_syn_sent | tcp_syn_recv | tcp_fin_wait1 | tcp_fin_wait2 | tcp_time_wait | tcp_close | tcp_close_wait | tcp_last_ack | tcp_listen | tcp_closing (unit: sockets)\n"
@@ -819,6 +819,11 @@ def pick_metric_value(parsed: Dict[str, Any], args) -> Tuple[str, float]:
         return (m, float(val)) if val is not None else (m, None)
 
     # Uptime
+    if m == "uptime_hours":
+        val = parsed.get("uptime", {}).get("uptime_seconds")
+        if val is not None:
+            return ("uptime_hours", float(val) / 3600.0)
+        return ("uptime_hours", None)
     if m == "uptime_seconds":
         val = parsed.get("uptime", {}).get("uptime_seconds")
         return (m, float(val)) if val is not None else (m, None)
