@@ -158,12 +158,29 @@ object CheckCommand "joviandss-metric" {
     "--port" = "$joviandss_port$"
     "--user" = "$joviandss_user$"
     "--identity" = "$joviandss_identity$"
+    "--ssh-opt" = {
+        value = "$joviandss_ssh_opt$"
+        repeat_key = true
+    }
     "--command" = "check_mk_agent"
     "--metric" = "$joviandss_metric$"
     "--format" = "nagios"
-    "--warn" = "$joviandss_warn$"
-    "--crit" = "$joviandss_crit$"
+    "--warn" = {
+      set_if = "$joviandss_warn$"
+      value = "$joviandss_warn$"
+    }
+    "--crit" = {
+      set_if = "$joviandss_crit$"
+      value = "$joviandss_crit$"
+    }
   }
+  vars.joviandss_ssh_opt = [
+    "HostKeyAlgorithms=+ssh-rsa",
+    "PubkeyAcceptedAlgorithms=+ssh-rsa",
+    "IdentitiesOnly=yes",
+    "PreferredAuthentications=publickey",
+    "StrictHostKeyChecking=accept-new"
+  ]
 }
 ```
 
