@@ -698,7 +698,9 @@ def dataset_usage_from_zfsget(
                 if row.get("fs") == dataset:
                     size = row.get("size_bytes")
                     used = row.get("used_bytes")
-                    used_pct = round(100.0 * used / size, 2) if size else None
+                    # Prefer df's own percentage if available to avoid unit mismatches
+                    df_pct = row.get("use_percent")
+                    used_pct = float(df_pct) if df_pct is not None else (round(100.0 * used / size, 2) if size else None)
                     return {"used_bytes": used, "quota_bytes": size, "used_pct": used_pct}
         return {}
     props = zfsget[dataset]
@@ -718,6 +720,9 @@ def dataset_usage_from_zfsget(
                 break
     # Fallback: if no quota, try capacity from df using mountpoint
     capacity_b = None
+    df_pct = None
+    df_used_b = None
+    df_size_b = None
     if (not quota_b or quota_b == 0) and props.get("mountpoint", {}).get("value") not in (None, "none", "-", "legacy"):
         mnt = props.get("mountpoint", {}).get("value")
         if df_rows:
@@ -727,6 +732,9 @@ def dataset_usage_from_zfsget(
                     # If we don't have used bytes yet, use df used
                     if used_b is None:
                         used_b = row.get("used_bytes")
+                    df_pct = row.get("use_percent")
+                    df_used_b = row.get("used_bytes")
+                    df_size_b = row.get("size_bytes")
                     break
     # Compute percent
     used_pct = None
@@ -736,6 +744,18 @@ def dataset_usage_from_zfsget(
             used_pct = round(100.0 * float(used_b) / float(denom), 2)
         except Exception:
             used_pct = None
+    # If we used df capacity fallback, prefer df's own percent (or compute from df used/size)
+    if (quota_b is None or quota_b == 0) and capacity_b is not None:
+        if df_pct is not None:
+            try:
+                used_pct = float(df_pct)
+            except Exception:
+                used_pct = used_pct
+        elif df_used_b is not None and df_size_b:
+            try:
+                used_pct = round(100.0 * float(df_used_b) / float(df_size_b), 2)
+            except Exception:
+                pass
     return {"used_bytes": used_b, "quota_bytes": quota_b or capacity_b, "used_pct": used_pct}
 
 # Compute all datasets usage
@@ -760,7 +780,8 @@ def all_datasets_usage(zfsget: Dict[str, Dict[str, Dict[str, Any]]], df_rows: Li
     for row in df_rows:
         size = row.get("size_bytes")
         used = row.get("used_bytes")
-        used_pct = round(100.0 * used / size, 2) if size else None
+        df_pct = row.get("use_percent")
+        used_pct = float(df_pct) if df_pct is not None else (round(100.0 * used / size, 2) if size else None)
         out.append({
             "dataset": row.get("fs"),
             "used_bytes": used,
