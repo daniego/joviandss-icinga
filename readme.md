@@ -56,6 +56,7 @@ python3 check_opene_joviandss.py --input-file samples/checkmk_output.txt --metri
   - `load` (unit: load average, includes load1/load5/load15; thresholds apply to load1)
 - **Uptime:**
   - `uptime_seconds`, `idle_seconds` (unit: seconds)
+  - `uptime_hosurs`, `idle_hours` (unit: hours)
 - **Memory:**
   - `mem_used_pct` (unit: %)
   - `mem_used_bytes`, `mem_total_bytes` (unit: bytes)
@@ -91,6 +92,7 @@ python3 check_opene_joviandss.py --input-file samples/checkmk_output.txt --metri
 |----------------------|-------------------------------------------|----------------|
 | load                 | CPU load average (includes load1/load5/load15; thresholds apply to load1) | load           |
 | uptime_seconds       | System uptime                             | seconds        |
+| uptime_hours.        | System uptime                             | hours          |
 | idle_seconds         | System idle time                          | seconds        |
 | mem_used_pct         | Memory used                               | %              |
 | mem_used_bytes       | Memory used                               | bytes          |

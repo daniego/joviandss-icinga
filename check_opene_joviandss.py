@@ -704,26 +704,43 @@ def dataset_usage_from_zfsget(
                     return {"used_bytes": used, "quota_bytes": size, "used_pct": used_pct}
         return {}
     props = zfsget[dataset]
-    # pick used
-    used_b = None
-    for k in ("usedbydataset", "used"):
-        if k in props:
-            used_b = props[k].get("bytes")
-            if used_b is not None:
-                break
-    # pick quota
+    # Determine quotas
+    refquota_b = None
     quota_b = None
-    for k in ("refquota", "quota"):
-        if k in props:
-            quota_b = props[k].get("bytes")
-            if quota_b:
-                break
+    if "refquota" in props:
+        refquota_b = props["refquota"].get("bytes")
+    if "quota" in props:
+        quota_b = props["quota"].get("bytes")
+
+    # Select denominator and matching usage:
+    #  - If refquota is set (>0): use referenced (or usedbydataset as fallback)
+    #  - Else if quota is set (>0): use used (or usedbydataset as fallback)
+    used_b = None
+    denom = None
+    if refquota_b and refquota_b > 0:
+        denom = refquota_b
+        if "referenced" in props and props["referenced"].get("bytes") is not None:
+            used_b = props["referenced"].get("bytes")
+        elif "usedbydataset" in props and props["usedbydataset"].get("bytes") is not None:
+            used_b = props["usedbydataset"].get("bytes")
+        else:
+            used_b = props.get("used", {}).get("bytes")
+    elif quota_b and quota_b > 0:
+        denom = quota_b
+        if "used" in props and props["used"].get("bytes") is not None:
+            used_b = props["used"].get("bytes")
+        elif "usedbydataset" in props and props["usedbydataset"].get("bytes") is not None:
+            used_b = props["usedbydataset"].get("bytes")
+        else:
+            used_b = props.get("referenced", {}).get("bytes")
+    else:
+        denom = None  # no quota present; we may fall back to df below
     # Fallback: if no quota, try capacity from df using mountpoint
     capacity_b = None
     df_pct = None
     df_used_b = None
     df_size_b = None
-    if (not quota_b or quota_b == 0) and props.get("mountpoint", {}).get("value") not in (None, "none", "-", "legacy"):
+    if denom is None and props.get("mountpoint", {}).get("value") not in (None, "none", "-", "legacy"):
         mnt = props.get("mountpoint", {}).get("value")
         if df_rows:
             for row in df_rows:
@@ -736,16 +753,16 @@ def dataset_usage_from_zfsget(
                     df_used_b = row.get("used_bytes")
                     df_size_b = row.get("size_bytes")
                     break
-    # Compute percent
+    # Compute percent strictly from the chosen denominator
     used_pct = None
-    denom = quota_b if quota_b and quota_b > 0 else capacity_b
     if denom and denom > 0 and used_b is not None:
         try:
             used_pct = round(100.0 * float(used_b) / float(denom), 2)
         except Exception:
             used_pct = None
-    # If we used df capacity fallback, prefer df's own percent (or compute from df used/size)
-    if (quota_b is None or quota_b == 0) and capacity_b is not None:
+
+    # If no quota-derived denominator, and we fell back to df capacity, prefer df's percent
+    if denom is None and capacity_b is not None:
         if df_pct is not None:
             try:
                 used_pct = float(df_pct)
@@ -756,7 +773,8 @@ def dataset_usage_from_zfsget(
                 used_pct = round(100.0 * float(df_used_b) / float(df_size_b), 2)
             except Exception:
                 pass
-    return {"used_bytes": used_b, "quota_bytes": quota_b or capacity_b, "used_pct": used_pct}
+
+    return {"used_bytes": used_b, "quota_bytes": denom or capacity_b, "used_pct": used_pct}
 
 # Compute all datasets usage
 def all_datasets_usage(zfsget: Dict[str, Dict[str, Dict[str, Any]]], df_rows: List[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
