@@ -1458,7 +1458,7 @@ def main():
                 text = ["OK", "WARNING", "CRITICAL", "UNKNOWN"][state]
                 perf = []
                 if res_cnt is not None:
-                    perf.append(f"ha_resources_on_local={res_cnt};;;\;")
+                    perf.append(f"ha_resources_on_local={res_cnt};;;")
                 print(f"{text} - ha_role={role} | " + (" ".join(perf) if perf else ""))
                 sys.exit(state)
                 return
