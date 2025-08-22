@@ -510,6 +510,65 @@ def parse_postfix_mailq(block: List[str]) -> int:
     return None
 
 
+# ----------- HA/Pacemaker and Checkmk helpers -----------
+
+def parse_check_mk_info(block: List[str]) -> Dict[str, Any]:
+    """
+    Parse the generic check_mk info block to extract the local hostname and misc fields.
+    Looks for lines like "Hostname: <name>" or "host_name <name>".
+    Returns keys: hostname (str|None).
+    """
+    info: Dict[str, Any] = {"hostname": None}
+    for line in block:
+        s = line.strip()
+        if not s:
+            continue
+        # Common formats
+        m = re.search(r"Hostname:\s*(\S+)", s, re.IGNORECASE)
+        if m:
+            info["hostname"] = m.group(1)
+            continue
+        m = re.search(r"host_name\s+(\S+)", s, re.IGNORECASE)
+        if m and not info.get("hostname"):
+            info["hostname"] = m.group(1)
+            continue
+    return info
+
+
+def parse_heartbeat_crm(block: List[str]) -> Dict[str, Any]:
+    """
+    Parse Pacemaker/CRM summary from the <<<heartbeat_crm>>> section.
+    Extract online nodes and where resources are started. Example lines:
+      "Online: [ nw-oe01 nw-oe02 ]"
+      "resource zpool-nas Started nw-oe01"
+    Returns: {"online_nodes": [...], "resources": {res_name: node_started}, "started_counts": {node: cnt}}
+    """
+    online_nodes: List[str] = []
+    resources: Dict[str, str] = {}
+    started_counts: Dict[str, int] = {}
+
+    for line in block:
+        s = line.strip()
+        if not s:
+            continue
+        # Online nodes line
+        m = re.search(r"Online:\s*\[(.*?)\]", s, re.IGNORECASE)
+        if m:
+            inside = m.group(1).strip()
+            if inside:
+                online_nodes = [tok for tok in inside.split() if tok]
+            continue
+        # Resource started matcher
+        m = re.search(r"^(?P<res>\S.*?)\s+Started\s+(?P<node>\S+)$", s, re.IGNORECASE)
+        if m:
+            res = m.group("res").strip()
+            node = m.group("node").strip()
+            resources[res] = node
+            started_counts[node] = started_counts.get(node, 0) + 1
+            continue
+    return {"online_nodes": online_nodes, "resources": resources, "started_counts": started_counts}
+
+
 # ----------- Specific decoders for known sections -----------
 
 def parse_keyval_kb(block: List[str]) -> Dict[str, int]:
@@ -835,6 +894,7 @@ METRIC_HELP_TEXT = (
     "  ZFS pools: zpool_worst_cap_pct (unit: %, Nagios includes per-pool SIZE/ALLOC/FREE/FRAG/CAP/DEDUP/HEALTH text + perfdata) | zpool_unhealthy_count (unit: pools) | zpool_pool_cap_pct (requires --pool, unit: %)\n"
     "  ZFS datasets (require --dataset for a specific dataset). If omitted, dataset_* defaults to the worst-used dataset:\n"
     "    dataset_used_pct (unit: %) | dataset_used_bytes (unit: B) | dataset_quota_bytes (unit: B) | all_datasets\n"
+    "  High Availability (Pacemaker/CRM): ha_role (unit: string: active|passive|unknown) | ha_resources_on_local (unit: count)\n"
     "  Plugins/inventory: plugins_count (unit: count)\n"
     "  Mail: postfix_queue_length (unit: messages)\n"
 )
@@ -1013,6 +1073,15 @@ def pick_metric_value(parsed: Dict[str, Any], args) -> Tuple[str, float]:
         val = (parsed.get("postfix") or {}).get("queue_length")
         return (m, float(val)) if val is not None else (m, None)
 
+    # HA metrics
+    if m == "ha_role":
+        val = (parsed.get("ha") or {}).get("role")
+        # For value-like outputs we keep it string; Nagios/KV handled later
+        return (m, val)
+    if m == "ha_resources_on_local":
+        val = (parsed.get("ha") or {}).get("resources_on_local")
+        return (m, float(val)) if val is not None else (m, None)
+
     return (m, None)
 
 
@@ -1103,6 +1172,12 @@ def parse_agent_output(raw: str) -> Dict[str, Any]:
             q = parse_postfix_mailq(lines)
             result["postfix"] = {"queue_length": q}
 
+        elif name == "check_mk":
+            result["check_mk"] = parse_check_mk_info(lines)
+
+        elif name == "heartbeat_crm":
+            result["heartbeat_crm"] = parse_heartbeat_crm(lines)
+
         # You can add more section decoders here if needed.
 
         i += 1
@@ -1162,6 +1237,41 @@ def parse_agent_output(raw: str) -> Dict[str, Any]:
                 unhealthy += 1
         result["zpool_summary"] = {"worst_cap_pct": worst, "unhealthy_count": unhealthy}
 
+    # HA role derivation (active/passive/unknown)
+    # Prefer heartbeat_crm if available; fallback to presence/absence of imported zpools
+    local_host = ((result.get("check_mk") or {}).get("hostname"))
+    crm = result.get("heartbeat_crm") or {}
+    role = "unknown"
+    resources_on_local = None
+
+    if crm:
+        started_counts = crm.get("started_counts") or {}
+        if local_host and local_host in started_counts:
+            resources_on_local = started_counts.get(local_host, 0)
+            role = "active" if resources_on_local > 0 else "passive"
+        else:
+            # If we don't know local_host, pick the node with most started resources; if tied, unknown
+            if started_counts:
+                # find max
+                max_node = max(started_counts.items(), key=lambda kv: kv[1])
+                # If zpool section suggests active here, we can still hint
+                if (result.get("zpool") or {}):
+                    role = "active"
+                else:
+                    role = "passive" if max_node[1] == 0 else "unknown"
+                resources_on_local = None
+    # Fallback heuristic if no CRM data
+    if role == "unknown":
+        if result.get("zpool"):
+            role = "active"
+            resources_on_local = resources_on_local if resources_on_local is not None else 0
+        else:
+            # If zpool says "no pools available" it is typically the passive node
+            role = "passive"
+            resources_on_local = resources_on_local if resources_on_local is not None else 0
+
+    result["ha"] = {"role": role, "resources_on_local": resources_on_local}
+
     # Normalize key names for ARC sizes to *_bytes for metric picker
     if "zfs_arc_cache" in result:
         arc = result["zfs_arc_cache"]
@@ -1181,7 +1291,7 @@ def parse_agent_output(raw: str) -> Dict[str, Any]:
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Fetch and parse Checkmk agent output from Open-E. Supports JSON, single-value outputs, and a rich set of --metric selections (see --metric help).")
+    ap = argparse.ArgumentParser(description="Fetch and parse Checkmk agent output from Open-E. Supports JSON, single-value outputs, and a rich set of --metric selections (CPU, memory, filesystems, ZFS pools/datasets/ARC, TCP, Postfix, and HA via Pacemaker/CRM).")
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument("--input-file", help="Parse from local file (saved agent output)")
     src.add_argument("--host", help="SSH host/IP of Open-E")
@@ -1319,6 +1429,42 @@ def main():
                 sys.exit(state)
                 return
             # For 'value' (and any other fallthrough), we already picked load1 in pick_metric_value
+
+        # Special handling for HA role metric
+        if args.metric == "ha_role":
+            ha = parsed.get("ha") or {}
+            role = ha.get("role")
+            res_cnt = ha.get("resources_on_local")
+            if args.format == "json":
+                out = {"metric": "ha_role", "value": role, "source": "agent", "context": {"resources_on_local": res_cnt}}
+                print(json.dumps(out, indent=2 if args.pretty else None))
+                return
+            if role is None:
+                if args.format == "nagios":
+                    print("UNKNOWN - ha_role not available | ha_resources_on_local=NaN;;;;")
+                    sys.exit(3)
+                elif args.format == "kv":
+                    print("ha_role=NaN")
+                    return
+                else:
+                    print("NaN")
+                    return
+            if args.format == "kv":
+                print(f"ha_role={role}")
+                return
+            if args.format == "nagios":
+                # For HA role there is no warn/crit; always OK if known
+                state = 0
+                text = ["OK", "WARNING", "CRITICAL", "UNKNOWN"][state]
+                perf = []
+                if res_cnt is not None:
+                    perf.append(f"ha_resources_on_local={res_cnt};;;\;")
+                print(f"{text} - ha_role={role} | " + (" ".join(perf) if perf else ""))
+                sys.exit(state)
+                return
+            # value format: print the string
+            print(role)
+            return
 
         if args.format == "json":
             out = {"metric": label, "value": value, "source": "agent", "context": {

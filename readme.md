@@ -15,6 +15,7 @@ and expose them in a format compatible with Icinga2 (Nagios plugin style).
   - Process counts
   - Filesystem usage (per mount, per fs, or aggregated)
   - ZFS dataset usage (quota-aware, with df fallback)
+  - High Availability (Pacemaker/CRM) role detection (active/passive) and resource counts
   - Plugins/inventory
 - Flexible output formats:
   - `json` — full parsed JSON
@@ -73,6 +74,10 @@ python3 check_opene_joviandss.py --input-file samples/checkmk_output.txt --metri
   - `dataset_used_pct` (unit: %)
   - `dataset_used_bytes`, `dataset_quota_bytes` (unit: bytes)
   - `all_datasets` (unit: list / % when summarized)
+
+- **High Availability (Pacemaker/CRM):**
+  - `ha_role` (unit: string: active|passive|unknown)
+  - `ha_resources_on_local` (unit: count)
 - **Plugins:**
   - `plugins_count` (unit: count)
 - **TCP connections:**
@@ -110,6 +115,8 @@ python3 check_opene_joviandss.py --input-file samples/checkmk_output.txt --metri
 | dataset_used_bytes   | ZFS dataset used                          | bytes          |
 | dataset_quota_bytes  | ZFS dataset quota                         | bytes          |
 | all_datasets         | All ZFS datasets (summary/worst %)        | % or list      |
+| ha_role             | HA role (active/passive/unknown)          | string        |
+| ha_resources_on_local | Number of cluster resources started on this node | count   |
 | plugins_count        | Plugins count                             | count          |
 | tcp_established      | TCP established connections               | sockets        |
 | tcp_syn_sent         | TCP SYN sent connections                   | sockets        |
