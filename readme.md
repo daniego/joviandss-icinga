@@ -84,8 +84,10 @@ python3 check_opene_joviandss.py --input-file samples/checkmk_output.txt --metri
   - `tcp_established`, `tcp_syn_sent`, `tcp_syn_recv`, `tcp_fin_wait1`, `tcp_fin_wait2`, `tcp_time_wait`, `tcp_close`, `tcp_close_wait`, `tcp_last_ack`, `tcp_listen`, `tcp_closing` (unit: sockets)
 - **ZFS ARC cache:**
   - `arc_size_bytes`, `arc_compressed_size_bytes`, `arc_uncompressed_size_bytes`, `l2_size_bytes`, `l2_asize_bytes`, `arc_hit_ratio`, `l2_hit_ratio`
+    - On passive HA nodes these will return OK with NaN values.
 - **ZFS pools:**
   - `zpool_worst_cap_pct`, `zpool_unhealthy_count`, `zpool_pool_cap_pct` (requires --pool)
+    - On passive HA nodes `zpool_worst_cap_pct` will return OK with NaN values.
 - **Network interfaces:**
   - `net_up_if_count` (unit: count)
 - **Mail queue:**
@@ -153,6 +155,7 @@ python3 check_opene_joviandss.py --input-file samples/checkmk_output.txt --metri
 - Thresholds are evaluated against the main numeric value of the metric.
 - For `load`, thresholds apply to the 1-minute load average (`load1`).
 - Other metrics (like percentages) compare directly to the numeric value.
+- On passive HA nodes, storage-specific metrics like `zpool_worst_cap_pct` and ARC/L2ARC metrics (`arc_hit_ratio`, etc.) are reported as OK (not applicable) instead of UNKNOWN.
 
 ### Icinga2 Integration
 

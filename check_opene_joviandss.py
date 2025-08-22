@@ -1474,6 +1474,17 @@ def main():
             return
         if value is None:
             if args.format == "nagios":
+                # If HA role is passive, certain storage metrics are not applicable but should be OK
+                ha_role = (parsed.get("ha") or {}).get("role")
+                passive_na_metrics = {
+                    "zpool_worst_cap_pct",
+                    "arc_hit_ratio", "l2_hit_ratio",
+                    "arc_size_bytes", "arc_compressed_size_bytes", "arc_uncompressed_size_bytes",
+                    "l2_size_bytes", "l2_asize_bytes",
+                }
+                if ha_role == "passive" and label in passive_na_metrics:
+                    print(f"OK - {label} not applicable on passive node | {label}=NaN;;;;")
+                    sys.exit(0)
                 print(f"UNKNOWN - {label} not available | {label}=NaN;;;;")
                 sys.exit(3)
             elif args.format == "kv":
@@ -1496,6 +1507,11 @@ def main():
         if args.metric == "zpool_worst_cap_pct" and args.format == "nagios":
             pools = parsed.get("zpool") or {}
             if value is None or not pools:
+                # If HA says this is a passive node, treat as OK (not applicable)
+                ha_role = (parsed.get("ha") or {}).get("role")
+                if ha_role == "passive":
+                    print("OK - zpool_worst_cap_pct not applicable on passive node | zpool_worst_cap_pct=NaN;;;;")
+                    sys.exit(0)
                 print("UNKNOWN - zpool_worst_cap_pct not available | zpool_worst_cap_pct=NaN;;;;")
                 sys.exit(3)
 
